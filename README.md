@@ -152,3 +152,55 @@ El enum recibe primitivos (`precio`, `nombre`) y no un `Producto`, para no crear
 [INFO] Tests run: 31, Failures: 0, Errors: 0, Skipped: 0
 [INFO] BUILD SUCCESS
 ```
+
+---
+
+## Parte 2 — Diagnóstico y resolución de acoplamiento entre paquetes
+
+### Paso 1 — El módulo de reportes introduce el acoplamiento
+
+Se agregó el paquete `reportes` (`ReporteBajoStockService`) y se hizo que `InventarioService` lo notifique al detectar bajo stock, mediante un colaborador opcional inyectado por *setter* (`@Autowired(required = false)`), tal como indica el enunciado. Para que el reporte tenga contenido real, `InventarioService` expone `listarProductosBajoStock()` y `generarReporte()` arma un texto plano con los productos por debajo del mínimo.
+
+Resultado de `mvn test` tras el commit del módulo: **31 pruebas, 0 fallos**. El guard `reporteBajoStockService != null` evita el `NullPointerException` en las pruebas, que instancian `InventarioService` sin ese colaborador. **Compila, las pruebas pasan y el diseño ya está roto.**
+
+### Paso 2 — Diagnóstico con una prueba de arquitectura
+
+`ArquitecturaPaquetesTest` usa ArchUnit (`slices().matching("com.universidad.refactoringu11.(*)..").should().beFreeOfCycles()`).
+
+**Diagrama de paquetes ANTES (con el ciclo):**
+
+```mermaid
+flowchart LR
+    I["paquete <b>inventario</b><br/>InventarioService"] -- "importa ReporteBajoStockService<br/>(campo, setter, generarReporte())" --> R["paquete <b>reportes</b><br/>ReporteBajoStockService"]
+    R -- "importa InventarioService<br/>(constructor, listarProductosBajoStock())" --> I
+```
+
+```
+  inventario  ────────────────────►  reportes
+  (dominio)   ◄────────────────────  (infraestructura)
+        dos flechas en sentidos opuestos = CICLO
+```
+
+**Salida de `mvn test -Dtest=ArquitecturaPaquetesTest` en este punto (en rojo):**
+
+```
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0 <<< FAILURE! -- in ...ArquitecturaPaquetesTest
+Architecture Violation [Priority: MEDIUM] - Rule 'slices matching 'com.universidad.refactoringu11.(*)..'
+should be free of cycles' was violated (1 times):
+Cycle detected: Slice inventario ->
+                Slice reportes ->
+                Slice inventario
+  1. Dependencies of Slice inventario
+    - Field  InventarioService.reporteBajoStockService has type reportes.ReporteBajoStockService
+    - Method InventarioService.setReporteBajoStockService(reportes.ReporteBajoStockService) has parameter of type ...
+    - Method InventarioService.alertarBajoStock(Producto) calls reportes.ReporteBajoStockService.generarReporte()
+  2. Dependencies of Slice reportes
+    - Constructor ReporteBajoStockService.<init>(inventario.InventarioService) has parameter of type ...
+    - Field  ReporteBajoStockService.inventarioService has type inventario.InventarioService
+    - Method ReporteBajoStockService.generarReporte() calls inventario.InventarioService.listarProductosBajoStock()
+[INFO] BUILD FAILURE
+```
+
+**Las pruebas de negocio de la Parte 1 siguen en verde a pesar del ciclo** (`InventarioServiceTest`, `ClasificadorProductoTest`, `EtiquetadoProductoTest`: 31 pruebas, 0 fallos). Es la evidencia de que el problema es de arquitectura y no de comportamiento: ni el compilador ni las pruebas de negocio lo ven.
+
+> **Hallazgo adicional (ciclo de *beans*, distinto del ciclo de paquetes).** Con el diseño literal del enunciado, la aplicación **no arranca** (`APPLICATION FAILED TO START`): `ReporteBajoStockService` pide `InventarioService` por constructor e `InventarioService` pide `ReporteBajoStockService` por *setter*, y Spring Boot prohíbe las referencias circulares entre *beans*. Las pruebas no lo detectan porque no levantan Spring. Se resolvió con `@Lazy` en el parámetro del constructor de `ReporteBajoStockService` (se verificó con `mvn spring-boot:run` → `Started RefactoringU11Application`). `@Lazy` no elimina el ciclo de paquetes: eso se resuelve en el Paso 3.
