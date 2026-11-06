@@ -204,3 +204,152 @@ Cycle detected: Slice inventario ->
 **Las pruebas de negocio de la Parte 1 siguen en verde a pesar del ciclo** (`InventarioServiceTest`, `ClasificadorProductoTest`, `EtiquetadoProductoTest`: 31 pruebas, 0 fallos). Es la evidencia de que el problema es de arquitectura y no de comportamiento: ni el compilador ni las pruebas de negocio lo ven.
 
 > **Hallazgo adicional (ciclo de *beans*, distinto del ciclo de paquetes).** Con el diseño literal del enunciado, la aplicación **no arranca** (`APPLICATION FAILED TO START`): `ReporteBajoStockService` pide `InventarioService` por constructor e `InventarioService` pide `ReporteBajoStockService` por *setter*, y Spring Boot prohíbe las referencias circulares entre *beans*. Las pruebas no lo detectan porque no levantan Spring. Se resolvió con `@Lazy` en el parámetro del constructor de `ReporteBajoStockService` (se verificó con `mvn spring-boot:run` → `Started RefactoringU11Application`). `@Lazy` no elimina el ciclo de paquetes: eso se resuelve en el Paso 3.
+
+### Paso 3 — Resolver el ciclo invirtiendo la dependencia
+
+**Técnica:** Principio de Inversión de Dependencias. Se extrajo la interfaz `NotificadorBajoStock` en el paquete `inventario`; `InventarioService` depende solo de ella y `ReporteBajoStockService` la implementa.
+
+**Diagrama de paquetes DESPUÉS (sin ciclo):**
+
+```mermaid
+flowchart LR
+    R["paquete <b>reportes</b><br/>ReporteBajoStockService"] -- "implements NotificadorBajoStock<br/>usa InventarioService, Producto" --> I["paquete <b>inventario</b><br/>InventarioService · Producto · <b>NotificadorBajoStock</b> (interfaz)"]
+```
+
+```
+  reportes  ─────────────────────►  inventario
+  (infraestructura)                  (dominio, define NotificadorBajoStock)
+        una sola flecha: reportes → inventario
+```
+
+Dentro del código, la inversión se ve así:
+
+```
+Antes:   InventarioService ──depende de──► ReporteBajoStockService      (dominio → infraestructura)
+Después: InventarioService ──depende de──► NotificadorBajoStock ◄──implementa── ReporteBajoStockService
+```
+
+`InventarioService` ya **no importa ninguna clase de `reportes`** (comprobable con `grep -rn "reportes" src/main/java/com/universidad/refactoringu11/inventario` → sin resultados). La parte relevante:
+
+```java
+private NotificadorBajoStock notificador;           // abstracción, no implementación
+
+@Autowired(required = false)
+public void setNotificador(NotificadorBajoStock notificador) { this.notificador = notificador; }
+
+private String alertarBajoStock(Producto producto) {
+    int cantidadReorden = calcularCantidadReorden(producto);
+    if (notificador != null) {
+        notificador.notificar(producto, cantidadReorden);
+    }
+    System.out.println("ALERTA: " + producto.getNombre()
+            + " bajo stock minimo. Reordenar " + cantidadReorden + " unidades.");
+    return "OK_BAJO_STOCK_REORDEN_" + cantidadReorden;
+}
+```
+
+`ReporteBajoStockService` implementa `notificar(...)` registrando la cantidad de reorden por producto, y `generarReporte()` combina esa información con los productos que `InventarioService` reporta hoy como bajo el mínimo.
+
+**Salida de `mvn test -Dtest=ArquitecturaPaquetesTest` ahora (en verde):**
+
+```
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in ...ArquitecturaPaquetesTest
+[INFO] BUILD SUCCESS
+```
+
+#### Decisión de diseño 3 — ¿por qué `NotificadorBajoStock` vive en `inventario` y no en `reportes`?
+
+**Porque `inventario` es, en este proyecto, el paquete de mayor nivel de abstracción**, y la regla de la Guía de Contenido (sección 4.3) es que *los paquetes de infraestructura dependen de dominio; dominio nunca depende de infraestructura*.
+
+- **`inventario` es el dominio:** contiene las reglas de negocio (qué es un movimiento válido, cuándo hay bajo stock, cuánto reordenar). Existiría aunque no hubiera reportes.
+- **`reportes` es infraestructura/presentación:** es una vista derivada que consume los datos del dominio y es intercambiable (mañana podría ser un correo, un SMS o un *webhook*).
+- **Si la interfaz estuviera en `reportes`**, `InventarioService` tendría que importarla y el ciclo `inventario → reportes → inventario` reaparecería: se habría movido el problema sin resolverlo.
+- **Al estar en `inventario`**, es el dominio quien declara *qué necesita* ("avísame cuando algo quede bajo el mínimo") y la infraestructura quien decide *cómo* cumplirlo. Se pueden agregar nuevas implementaciones sin modificar `inventario` (Open/Closed), y las pruebas del dominio usan una simple lambda como notificador (`InventarioNotificacionTest`) sin conocer `reportes`.
+- La regla queda protegida por `ArquitecturaDireccionDependenciasTest` (`inventario` no puede depender de `reportes`) además de la ausencia de ciclos.
+
+### Paso 4 — Confirmar con las pruebas de la Parte 1 que el comportamiento no cambió
+
+Se volvió a ejecutar la suite completa sin modificar una sola línea de `InventarioServiceTest`, `ClasificadorProductoTest` ni `EtiquetadoProductoTest`:
+
+```bash
+git diff p1-caracterizacion HEAD -- src/test/java/com/universidad/refactoringu11/inventario/InventarioServiceTest.java \
+                         src/test/java/com/universidad/refactoringu11/inventario/ClasificadorProductoTest.java \
+                         src/test/java/com/universidad/refactoringu11/inventario/EtiquetadoProductoTest.java
+# (sin salida: los tres archivos son idénticos a como se escribieron en la Parte 1)
+```
+
+```
+[INFO] Tests run: 1,  Failures: 0 -- ArquitecturaDireccionDependenciasTest
+[INFO] Tests run: 1,  Failures: 0 -- ArquitecturaPaquetesTest
+[INFO] Tests run: 7,  Failures: 0 -- ClasificadorProductoTest      (Parte 1, sin modificar)
+[INFO] Tests run: 5,  Failures: 0 -- EtiquetadoProductoTest        (Parte 1, sin modificar)
+[INFO] Tests run: 5,  Failures: 0 -- InventarioNotificacionTest
+[INFO] Tests run: 19, Failures: 0 -- InventarioServiceTest         (Parte 1, sin modificar)
+[INFO] Tests run: 2,  Failures: 0 -- RefactoringU11ApplicationTests
+[INFO] Tests run: 4,  Failures: 0 -- ReporteBajoStockServiceTest
+[INFO] Tests run: 44, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+| Grupo | Pruebas | Estado |
+|---|---|---|
+| Caracterización de la Parte 1 (sin modificar) | 31 (19 + 7 + 5) | ✅ verde |
+| Arquitectura (`ArquitecturaPaquetesTest`, `ArquitecturaDireccionDependenciasTest`) | 2 | ✅ verde |
+| Nuevas de la Parte 2 (notificación, reporte, arranque de Spring) | 11 | ✅ verde |
+| **Total** | **44** | ✅ **0 fallos** |
+
+Como la inversión de dependencias no alteró ningún resultado, mensaje de consola ni efecto sobre el stock, **el comportamiento observable no cambió**. Además, `mvn spring-boot:run` arranca correctamente (`Started RefactoringU11Application`) y `RefactoringU11ApplicationTests` verifica el cableado real de Spring de punta a punta.
+
+#### Decisión de diseño 4 — `notificar(Producto, int)` por evento frente a `notificar(List<Producto>)` por lote
+
+**Decisión: una notificación por evento individual.**
+
+- **Coincide con lo que el dominio sabe.** `actualizarInventario` procesa *un* movimiento a la vez y, como máximo, deja *un* producto bajo el mínimo. El evento natural es "este producto, esta cantidad de reorden". Un lote obligaría a `InventarioService` a acumular productos, a decidir cuándo vaciar el búfer y a guardar estado mutable adicional: una responsabilidad nueva que no le corresponde.
+- **Firma mínima y sin acoplamiento temporal.** El implementador recibe todo lo que necesita (`Producto` y `cantidadReorden`) en cada llamada, no hay un "momento de enviar" que alguien deba recordar, y es fácil de probar (una lambda registra las llamadas).
+- **No cierra la puerta al lote.** Quien necesite agrupar puede hacerlo *dentro de su implementación*: `ReporteBajoStockService` ya acumula los eventos y luego los presenta como un único reporte. El dominio emite hechos, la infraestructura decide cómo agruparlos.
+- **Cuándo preferiría el lote:** cuando cada notificación sea cara o tenga efectos externos (correo, SMS, llamada HTTP) y muchos productos crucen el umbral a la vez: una importación masiva, una conciliación nocturna de miles de movimientos o un resumen diario de reorden para compras. Allí un envío por producto saturaría el canal y enviaría decenas de mensajes en lugar de uno consolidado, y un lote permitiría además tratarlo como una operación atómica. En ese caso se añadiría un segundo método (`notificarLote(List<...>)`) o un proceso programado que consulte `listarProductosBajoStock()`.
+
+### Paso 5 — Resumen final
+
+#### Historial de commits
+
+| # | Parte | Commit | Tag |
+|---|---|---|---|
+| 1 | 1 | `feat: crear inventario con Long Method ... y switch duplicado ...` | `p1-original` |
+| 2 | 1 | `test: agregar pruebas de caracterizacion antes de refactorizar (red de seguridad)` | `p1-caracterizacion` |
+| 3 | 1 | `refactor: eliminar Long Method en actualizarInventario ...` | `p1-long-method` |
+| 4 | 1 | `refactor: eliminar switch duplicado sobre TipoProducto con polimorfismo` | `p1-switch` |
+| 5 | 1 | `docs: documentar evidencia de code smells, decisiones de diseno y resultado de pruebas` | `p1-docs` |
+| 6 | 2 | `feat: agregar modulo de reportes con notificacion de bajo stock desde inventario` | `p2-reportes` |
+| 7 | 2 | `test: agregar prueba de arquitectura que detecta ciclo ... (en rojo)` | `p2-arch-rojo` |
+| 8 | 2 | `refactor: invertir la dependencia entre inventario y reportes extrayendo NotificadorBajoStock` | `p2-inversion` |
+| 9 | 2 | `test: cubrir la notificacion por interfaz, el reporte, el arranque de Spring y la direccion de dependencias` | `p2-pruebas` |
+| 10 | 2 | `docs: completar README con diagrama de paquetes antes/despues y decisiones de la Parte 2` | último commit |
+
+#### Estructura final
+
+```
+src/main/java/com/universidad/refactoringu11/
+├── RefactoringU11Application.java
+├── inventario/   Producto · TipoProducto · InventarioService · ClasificadorProducto
+│                 EtiquetadoProducto · NotificadorBajoStock
+└── reportes/     ReporteBajoStockService            (reportes → inventario, única dirección)
+src/test/java/com/universidad/refactoringu11/
+├── ArquitecturaPaquetesTest · ArquitecturaDireccionDependenciasTest · RefactoringU11ApplicationTests
+├── inventario/   InventarioServiceTest · ClasificadorProductoTest · EtiquetadoProductoTest · InventarioNotificacionTest
+└── reportes/     ReporteBajoStockServiceTest
+```
+
+#### Resumen de decisiones de diseño
+
+| # | Decisión | Elección |
+|---|---|---|
+| 1 | Reorden: ¿método privado o clase? | Método privado `calcularCantidadReorden` |
+| 2 | Polimorfismo: ¿enum o estrategia? | Enum con un método abstracto por comportamiento |
+| 3 | ¿Dónde vive `NotificadorBajoStock`? | En `inventario` (dominio) |
+| 4 | Granularidad de la notificación | Por evento (`notificar(Producto, int)`) |
+
+#### Notas y limitaciones conocidas
+
+- Los dos comportamientos heredados cuestionables (una `ENTRADA` con cantidad negativa deja el stock en negativo, y `tipoMovimiento == null` lanza `NullPointerException`) **se preservaron a propósito**: la actividad es de refactorización, no de corrección de errores. El primero está fijado por una prueba de caracterización.
+- `ReporteBajoStockService` guarda su estado en memoria y `InventarioService` usa colecciones no sincronizadas: es un laboratorio de diseño, no un servicio listo para concurrencia.
